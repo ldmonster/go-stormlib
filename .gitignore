@@ -1,0 +1,7 @@
+.cursor/
+.vscode/
+
+bin/
+parity-reports/
+tools/parity/testdata/
+build/

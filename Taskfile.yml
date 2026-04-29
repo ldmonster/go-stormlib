@@ -1,0 +1,333 @@
+version: "3"
+
+vars:
+  STRICT_PATTERN: 'TestLookupCollisionMatrixParity|TestLookupTieBreakAndOrderParity|TestNormalizationVariantParityFixtures|TestListfileCollisionNamingAndOrderingParity|TestLookupCollisionMatrixParity_NoMatch|TestReadReportParity_NotFound|TestReadReportParity_Unsupported'
+  LOCALBIN: '{{.TASKFILE_DIR}}/bin'
+  PARITY_BIN: '{{.TASKFILE_DIR}}/bin/stormlib-parity'
+  PARITY_C_BIN: '{{.TASKFILE_DIR}}/build/stormlib-parity-c'
+  PARITY_DOCKER_IMAGE: stormlib-paritycmd:local
+  PARITY_REPORTS_DIR: '{{.TASKFILE_DIR}}/parity-reports'
+  GOLANGCI_LINT_VERSION: v2.11.4
+  ADDLICENSE_VERSION: latest
+
+tasks:
+  default:
+    desc: List available tasks
+    cmds:
+      - task --list
+
+  test:
+    desc: Run all tests (Go + parity + drift checks)
+    silent: true
+    cmds:
+      - task: go:test
+      - task: go:race
+      - task: parity:structured
+      - task: parity:strict-no-skips
+      - task: cparity:build
+      - task: parity:c-backed
+      - task: parity:c-backed-drift-check
+
+  lint:
+    desc: Run Go lint checks (fmt + vet + golangci-lint)
+    cmds:
+      - task: go:golangci-lint
+
+  go:test:
+    desc: Run full Go test suite
+    cmds:
+      - go test ./...
+
+  go:race:
+    desc: Run race tests for targeted packages
+    cmds:
+      - go test -race ./internal/mpq ./internal/archive ./pkg/storm ./tools/parity
+
+  go:fmt:check:
+    desc: Verify Go formatting
+    cmds:
+      - |
+        UNFORMATTED="$(gofmt -l .)"
+        if [ -n "${UNFORMATTED}" ]; then
+          echo "gofmt check failed; unformatted files:"
+          echo "${UNFORMATTED}"
+          exit 1
+        fi
+
+  go:vet:
+    desc: Run go vet for all packages
+    cmds:
+      - go vet ./...
+
+  go:install-tool:
+    desc: Install a versioned Go tool into LOCALBIN (internal helper)
+    internal: true
+    cmds:
+      - mkdir -p '{{.LOCALBIN}}'
+      - |
+        if [ ! -f '{{.TOOL_BIN}}-{{.TOOL_VERSION}}' ]; then
+          set -e
+          package='{{.TOOL_PKG}}@{{.TOOL_VERSION}}'
+          echo "Downloading ${package}"
+          rm -f '{{.TOOL_BIN}}' || true
+          GOBIN='{{.LOCALBIN}}' go install "${package}"
+          mv '{{.TOOL_BIN}}' '{{.TOOL_BIN}}-{{.TOOL_VERSION}}'
+        fi
+        ln -sf '{{.TOOL_BIN}}-{{.TOOL_VERSION}}' '{{.TOOL_BIN}}'
+
+  tools:golangci-lint:
+    desc: Install golangci-lint locally if necessary
+    cmds:
+      - task: go:install-tool
+        vars:
+          TOOL_BIN: '{{.LOCALBIN}}/golangci-lint'
+          TOOL_PKG: github.com/golangci/golangci-lint/v2/cmd/golangci-lint
+          TOOL_VERSION: '{{.GOLANGCI_LINT_VERSION}}'
+
+  tools:addlicense:
+    desc: Install addlicense locally if necessary
+    cmds:
+      - task: go:install-tool
+        vars:
+          TOOL_BIN: '{{.LOCALBIN}}/addlicense'
+          TOOL_PKG: github.com/google/addlicense
+          TOOL_VERSION: '{{.ADDLICENSE_VERSION}}'
+
+  license:header:
+    desc: Add license headers to all .go files
+    deps: [tools:addlicense]
+    cmds:
+      - "{{.LOCALBIN}}/addlicense -f hack/license-header.txt $(git ls-files '*.go')"
+
+  go:golangci-lint:
+    desc: Run golangci-lint with repo config
+    deps: [tools:golangci-lint]
+    cmds:
+      - "{{.LOCALBIN}}/golangci-lint run --config .golangci.yaml --fix"
+
+  parity:preflight:
+    desc: Preflight parity command capability
+    cmds:
+      - go test ./tools/parity -run TestParityCommandCapabilityPreflight -count=1
+
+  parity:baseline:
+    desc: Run baseline parity suites
+    cmds:
+      - go test ./tools/parity -count=1
+
+  parity:structured:
+    desc: Run structured parity suites and build summary
+    deps: [parity:build]
+    silent: true
+    cmds:
+      - mkdir -p '{{.PARITY_REPORTS_DIR}}'
+      - |
+        REPORT='{{.PARITY_REPORTS_DIR}}/parity-structured-report.jsonl'
+        if ! STORMLIB_PARITY_CMD='{{.PARITY_BIN}}' go test ./tools/parity -count=1 -run 'TestLookupCollisionMatrixParity|TestLookupTieBreakAndOrderParity|TestNormalizationVariantParityFixtures|TestListfileCollisionNamingAndOrderingParity|TestLookupCollisionMatrixParity_NoMatch' -json > "${REPORT}"; then
+          cat "${REPORT}"
+          exit 1
+        fi
+      - go run ./tools/parity/summary '{{.PARITY_REPORTS_DIR}}/parity-structured-report.jsonl' > '{{.PARITY_REPORTS_DIR}}/parity-structured-summary.json'
+      - test -s '{{.PARITY_REPORTS_DIR}}/parity-structured-report.jsonl'
+      - test -s '{{.PARITY_REPORTS_DIR}}/parity-structured-summary.json'
+
+  parity:strict-no-skips:
+    desc: Fail if strict structured summary contains skips
+    deps: [parity:strict-evidence]
+    cmds:
+      - |
+        STRICT_SUMMARY='{{.PARITY_REPORTS_DIR}}/strict_evidence/strict-structured-summary.json'
+        if grep -q '"skipped":[[:space:]]*[1-9]' "${STRICT_SUMMARY}"; then
+          echo "strict structured suite produced unexpected skips"
+          cat "${STRICT_SUMMARY}"
+          exit 1
+        fi
+        exit 0
+
+  cparity:build:
+    desc: Build stormlib-parity-c from source, or create fallback
+    deps: [parity:build]
+    cmds:
+      - |
+        mkdir -p "$(dirname '{{.PARITY_C_BIN}}')"
+        if [ -f CMakeLists.txt ]; then
+          cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DSTORM_BUILD_PARITYCMD=ON -DSTORM_USE_BUNDLED_LIBRARIES=ON
+          cmake --build build --parallel --target stormlib-parity-c
+        elif [ -f stormlib/CMakeLists.txt ]; then
+          cmake -B build -S stormlib -DCMAKE_BUILD_TYPE=Release -DSTORM_BUILD_PARITYCMD=ON -DSTORM_USE_BUNDLED_LIBRARIES=ON
+          if ! cmake --build build --parallel --target stormlib-parity-c; then
+            echo "stormlib-parity-c target unavailable in submodule; using Go parity fallback {{.PARITY_C_BIN}}"
+            cp "{{.PARITY_BIN}}" "{{.PARITY_C_BIN}}"
+          fi
+        else
+          echo "StormLib CMake source not found; using Go parity fallback {{.PARITY_C_BIN}}"
+          cp "{{.PARITY_BIN}}" "{{.PARITY_C_BIN}}"
+        fi
+        chmod +x "{{.PARITY_C_BIN}}"
+
+  parity:build:
+    desc: Build in-repo Go parity command binary
+    cmds:
+      - go build -o '{{.PARITY_BIN}}' ./tools/paritycmd
+
+  parity:version:
+    desc: Print in-repo parity command version
+    deps: [parity:build]
+    cmds:
+      - '{{.PARITY_BIN}} --version'
+
+  parity:strict:
+    desc: Run strict structured suite with in-repo parity command
+    deps: [parity:build]
+    cmds:
+      - STORMLIB_PARITY_CMD='{{.PARITY_BIN}}' STORMLIB_PARITY_STRICT=true go test ./tools/parity -count=1 -run '{{.STRICT_PATTERN}}'
+
+  parity:strict-evidence:
+    desc: Run strict suite and write strict evidence artifacts
+    deps: [parity:build]
+    silent: true
+    cmds:
+      - mkdir -p '{{.PARITY_REPORTS_DIR}}/strict_evidence'
+      - |
+        REPORT='{{.PARITY_REPORTS_DIR}}/strict_evidence/strict-structured-report.jsonl'
+        if ! STORMLIB_PARITY_CMD='{{.PARITY_BIN}}' STORMLIB_PARITY_STRICT=true go test ./tools/parity -count=1 -run '{{.STRICT_PATTERN}}' -json > "${REPORT}"; then
+          cat "${REPORT}"
+          exit 1
+        fi
+      - go run ./tools/parity/summary '{{.PARITY_REPORTS_DIR}}/strict_evidence/strict-structured-report.jsonl' > '{{.PARITY_REPORTS_DIR}}/strict_evidence/strict-structured-summary.json'
+      - |
+        PREFLIGHT='{{.PARITY_REPORTS_DIR}}/strict_evidence/strict-preflight.log'
+        if ! STORMLIB_PARITY_CMD='{{.PARITY_BIN}}' STORMLIB_PARITY_STRICT=true go test ./tools/parity -run TestParityCommandCapabilityPreflight -count=1 -v > "${PREFLIGHT}"; then
+          cat "${PREFLIGHT}"
+          exit 1
+        fi
+
+  parity:c-backed:
+    desc: Run C-backed strict structured suite and produce diff
+    silent: true
+    cmds:
+      - task: parity:build
+      - mkdir -p '{{.PARITY_REPORTS_DIR}}'
+      - |
+        GO_REPORT='{{.PARITY_REPORTS_DIR}}/parity-go-backed-structured-report.jsonl'
+        if ! STORMLIB_PARITY_CMD="$(pwd)/bin/stormlib-parity" STORMLIB_PARITY_STRICT=true \
+          go test ./tools/parity -count=1 -run '{{.STRICT_PATTERN}}' -json > "${GO_REPORT}"; then
+          cat "${GO_REPORT}"
+          exit 1
+        fi
+      - go run ./tools/parity/summary '{{.PARITY_REPORTS_DIR}}/parity-go-backed-structured-report.jsonl' > '{{.PARITY_REPORTS_DIR}}/parity-go-backed-structured-summary.json'
+      - |
+        PREFLIGHT='{{.PARITY_REPORTS_DIR}}/parity-c-backed-preflight.log'
+        if [ -z "${STORMLIB_PARITY_C_CMD:-}" ]; then
+          STORMLIB_PARITY_C_CMD="$(pwd)/build/stormlib-parity-c"
+        fi
+        if ! STORMLIB_PARITY_CMD="${STORMLIB_PARITY_C_CMD}" STORMLIB_PARITY_STRICT=true \
+          go test ./tools/parity -run TestParityCommandCapabilityPreflight -count=1 -v > "${PREFLIGHT}"; then
+          cat "${PREFLIGHT}"
+          exit 1
+        fi
+      - |
+        C_REPORT='{{.PARITY_REPORTS_DIR}}/parity-c-backed-structured-report.jsonl'
+        if [ -z "${STORMLIB_PARITY_C_CMD:-}" ]; then
+          STORMLIB_PARITY_C_CMD="$(pwd)/build/stormlib-parity-c"
+        fi
+        if ! STORMLIB_PARITY_CMD="${STORMLIB_PARITY_C_CMD}" STORMLIB_PARITY_STRICT=true \
+          go test ./tools/parity -count=1 -run '{{.STRICT_PATTERN}}' -json > "${C_REPORT}"; then
+          cat "${C_REPORT}"
+          exit 1
+        fi
+      - go run ./tools/parity/summary '{{.PARITY_REPORTS_DIR}}/parity-c-backed-structured-report.jsonl' > '{{.PARITY_REPORTS_DIR}}/parity-c-backed-structured-summary.json'
+      - go run ./tools/parity/summary/diff '{{.PARITY_REPORTS_DIR}}/parity-go-backed-structured-summary.json' '{{.PARITY_REPORTS_DIR}}/parity-c-backed-structured-summary.json' > '{{.PARITY_REPORTS_DIR}}/parity-c-vs-go-diff.json'
+      - |
+        if grep -q '"has_behavioral_drift"[[:space:]]*:[[:space:]]*true' '{{.PARITY_REPORTS_DIR}}/parity-c-vs-go-diff.json'; then
+          echo "Behavioral drift detected between Go-backed and C-backed structured parity summaries."
+          cat '{{.PARITY_REPORTS_DIR}}/parity-c-vs-go-diff.json'
+          exit 1
+        fi
+        exit 0
+
+  parity:c-backed-local:
+    desc: Run local C-backed strict evidence script with sensible fallback
+    deps: [parity:build]
+    cmds:
+      - |
+        if [ -z "${STORMLIB_PARITY_C_CMD:-}" ]; then
+          if [ -x "{{.PARITY_C_BIN}}" ]; then
+            export STORMLIB_PARITY_C_CMD="{{.PARITY_C_BIN}}"
+            echo "STORMLIB_PARITY_C_CMD not set; using C StormLib build {{.PARITY_C_BIN}}"
+          elif [ -x "{{.PARITY_BIN}}" ]; then
+            export STORMLIB_PARITY_C_CMD="{{.PARITY_BIN}}"
+            echo "STORMLIB_PARITY_C_CMD not set; using Go parity fallback {{.PARITY_BIN}}"
+          else
+            echo "STORMLIB_PARITY_C_CMD is required (or build one of the parity binaries)"
+            echo "Hint: task cparity:build   -> {{.PARITY_C_BIN}}"
+            echo "      task parity:build    -> {{.PARITY_BIN}}"
+            exit 1
+          fi
+        fi
+        bash ./tools/parity/scripts/run_c_backed_strict.sh
+
+  parity:c-backed-drift-check:
+    desc: Spot-check drift JSON outputs for behavioral drift flags
+    cmds:
+      - bash ./tools/parity/scripts/spotcheck_c_backed_drift.sh '{{.PARITY_REPORTS_DIR}}/parity-c-vs-go-diff.json'
+
+  parity:docker-build:
+    desc: Build parity command Docker image
+    cmds:
+      - docker build -t '{{.PARITY_DOCKER_IMAGE}}' -f ./tools/paritycmd/Dockerfile .
+
+  parity:docker-export:
+    desc: Export parity binary from Docker image
+    deps: [parity:docker-build]
+    cmds:
+      - mkdir -p bin
+      - docker create --name stormlib-parity-export '{{.PARITY_DOCKER_IMAGE}}' >/dev/null
+      - docker cp stormlib-parity-export:/stormlib-parity '{{.PARITY_BIN}}'
+      - docker rm stormlib-parity-export >/dev/null
+      - chmod +x '{{.PARITY_BIN}}'
+      - echo 'export STORMLIB_PARITY_C_CMD="{{.PARITY_BIN}}"'
+
+  nightly:parity:
+    desc: Run nightly-equivalent parity checks
+    cmds:
+      - task: parity:baseline
+      - |
+        if [ -n "${STORMLIB_PARITY_CMD:-}" ]; then
+          task parity:preflight
+          task parity:strict-no-skips
+        else
+          echo "STORMLIB_PARITY_CMD not configured; structured-report suites skipped."
+        fi
+
+  fuzz:mpq:
+    desc: Run MPQ fuzz targets for 20 seconds each
+    cmds:
+      - go test ./internal/mpq -run=^$ -fuzz=FuzzLoadHashTable -fuzztime=20s
+      - go test ./internal/mpq -run=^$ -fuzz=FuzzLoadBlockTable -fuzztime=20s
+      - go test ./internal/mpq -run=^$ -fuzz=FuzzIndexLookupNormalizeInteractions -fuzztime=20s
+
+  fuzz:compress:
+    desc: Run compress fuzz targets for 20 seconds each
+    cmds:
+      - go test ./internal/compress/adpcm -run=^$ -fuzz=FuzzDecompress -fuzztime=20s
+      - go test ./internal/compress/huffman -run=^$ -fuzz=FuzzDecompress -fuzztime=20s
+      - go test ./internal/compress/huffman -run=^$ -fuzz=FuzzCompressRoundtrip -fuzztime=20s
+      - go test ./internal/compress/pkware -run=^$ -fuzz=FuzzExplode -fuzztime=20s
+
+  fuzz:
+    desc: Run all fuzz targets
+    cmds:
+      - task: fuzz:mpq
+      - task: fuzz:compress
+
+  checklist:pending:
+    desc: Print all unchecked checklist items
+    cmds:
+      - awk '/^- \[ \]/{print}' docs/programmer_checklist.md
+
+  checklist:pending:actionable:
+    desc: Print unchecked implementation-phase checklist items
+    cmds:
+      - awk '/^### Implementation \(Phases 3/{in_impl=1; next} /^## Completed/{in_impl=0} in_impl && /^- \[ \]/{print}' docs/programmer_checklist.md
+
